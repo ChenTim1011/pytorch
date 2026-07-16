@@ -16,6 +16,7 @@ from ..cpu_vec_isa import (
     VecAVX512VNNI,
     VecISA,
     VecNEON,
+    VecRVV,
     VecSVE,
 )
 from ..utils import IndentedBuffer, parallel_num_threads
@@ -169,7 +170,7 @@ inline void {{kernel_name}}(
             f"{self.name}<{value_to_cpp(accum, 'bool')}, {value_to_cpp(prefetch, 'bool')}>("
         )
         with res.indent():
-            kwargs_for_extra_args.update({"kernel": kernel})
+            kwargs_for_extra_args.update({"kernel": kernel, "B": B})
             extra_args = self.get_kernel_extra_args(**kwargs_for_extra_args)
             for arg in extra_args:
                 res.writeline(arg)
@@ -350,6 +351,14 @@ def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **
     return not check_int8_woq_small_m_dim(config, m, n, k, alpha, num_threads, **kwargs)
 
 
+def check_rvv_m1(config, m, n, k, alpha, num_threads, **kwargs):
+    return m == 1 and not kwargs.get("dynamic_M", False)
+
+
+def check_rvv_bf16_m_ge_2(config, m, n, k, alpha, num_threads, **kwargs):
+    return m >= 2 and not kwargs.get("dynamic_M", False)
+
+
 @register_micro_gemm(
     *generate_gemm_config(
         VecAVX512,
@@ -442,6 +451,15 @@ def do_not_use_with_small_m_for_int8_woq(config, m, n, k, alpha, num_threads, **
         input2_dtype=torch.float,
         output_dtype=torch.float,
         compute_dtype=torch.float,
+    ),
+    *generate_gemm_config(
+        VecRVV,
+        [(1, 24, 1), (1, 16, 1), (1, 8, 1)],
+        input_dtype=torch.float,
+        input2_dtype=torch.float,
+        output_dtype=torch.float,
+        compute_dtype=torch.float,
+        extra_check=check_rvv_m1,
     ),
 )
 class CppMicroGemmFP32Vec(CppMicroGemm):
@@ -970,6 +988,263 @@ inline void {{kernel_name}}_transpose_b_kernel(
             options
         )
         return result
+
+
+@register_micro_gemm(
+    *generate_gemm_config(
+        VecRVV,
+        [(1, 32, 1)],
+        input_dtype=torch.bfloat16,
+        input2_dtype=torch.bfloat16,
+        output_dtype=torch.float,
+        compute_dtype=torch.float,
+        extra_check=check_rvv_m1,
+    ),
+)
+class CppMicroGemmRVVBF16M1(CppMicroGemm):
+    TEMPLATE_ENTRY = r"""
+{{declare_kernel}} {
+    {{kernel.assert_function}}(M == 1, "CppMicroGemmRVVBF16M1 requires M=1");
+    constexpr int64_t BLOCK_N = {{block_n}};
+    if (ldb_col != 1) {
+        for (int64_t n = 0; n < N; n += 2) {
+            const bool has_second_n = n + 1 < N;
+            vfloat32m4_t acc_vec0 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+            vfloat32m4_t acc_vec1 = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+            for (int64_t k = 0; k < K;) {
+                const size_t vl = __riscv_vsetvl_e32m4(K - k);
+                const auto a_bf16_vec = __riscv_vle16_v_u16m2(
+                    reinterpret_cast<const uint16_t*>(A + k), vl);
+                auto a_bits_vec = __riscv_vzext_vf2_u32m4(a_bf16_vec, vl);
+                a_bits_vec = __riscv_vsll_vx_u32m4(a_bits_vec, 16, vl);
+                const auto a_vec = __riscv_vreinterpret_v_u32m4_f32m4(a_bits_vec);
+
+                const auto b_bf16_vec0 = __riscv_vle16_v_u16m2(
+                    reinterpret_cast<const uint16_t*>(B + k * ldb + n * ldb_col), vl);
+                auto b_bits_vec0 = __riscv_vzext_vf2_u32m4(b_bf16_vec0, vl);
+                b_bits_vec0 = __riscv_vsll_vx_u32m4(b_bits_vec0, 16, vl);
+                const auto b_vec0 = __riscv_vreinterpret_v_u32m4_f32m4(b_bits_vec0);
+                acc_vec0 =
+                    __riscv_vfmacc_vv_f32m4_tu(acc_vec0, a_vec, b_vec0, vl);
+
+                if (has_second_n) {
+                    const auto b_bf16_vec1 = __riscv_vle16_v_u16m2(
+                        reinterpret_cast<const uint16_t*>(
+                            B + k * ldb + (n + 1) * ldb_col), vl);
+                    auto b_bits_vec1 = __riscv_vzext_vf2_u32m4(b_bf16_vec1, vl);
+                    b_bits_vec1 = __riscv_vsll_vx_u32m4(b_bits_vec1, 16, vl);
+                    const auto b_vec1 =
+                        __riscv_vreinterpret_v_u32m4_f32m4(b_bits_vec1);
+                    acc_vec1 =
+                        __riscv_vfmacc_vv_f32m4_tu(acc_vec1, a_vec, b_vec1, vl);
+                }
+                k += static_cast<int64_t>(vl);
+            }
+            vfloat32m1_t sum_vec0 = __riscv_vfmv_v_f_f32m1(0.0f, __riscv_vsetvlmax_e32m1());
+            sum_vec0 = __riscv_vfredusum_vs_f32m4_f32m1(
+                acc_vec0, sum_vec0, __riscv_vsetvlmax_e32m4());
+            const float acc0 = __riscv_vfmv_f_s_f32m1_f32(sum_vec0);
+            C[n] = accum ? C[n] + acc0 * {{alpha}} : acc0 * {{alpha}};
+            if (has_second_n) {
+                vfloat32m1_t sum_vec1 = __riscv_vfmv_v_f_f32m1(0.0f, __riscv_vsetvlmax_e32m1());
+                sum_vec1 = __riscv_vfredusum_vs_f32m4_f32m1(
+                    acc_vec1, sum_vec1, __riscv_vsetvlmax_e32m4());
+                const float acc1 = __riscv_vfmv_f_s_f32m1_f32(sum_vec1);
+                C[n + 1] = accum ? C[n + 1] + acc1 * {{alpha}} : acc1 * {{alpha}};
+            }
+        }
+        return;
+    }
+    for (int64_t n = 0; n < N; n += BLOCK_N) {
+        const int64_t n_size = std::min<int64_t>(BLOCK_N, N - n);
+        for (int64_t j = 0; j < n_size;) {
+            const size_t vl = __riscv_vsetvl_e32m4(n_size - j);
+            vfloat32m4_t acc_vec = accum
+                ? __riscv_vle32_v_f32m4(C + n + j, vl)
+                : __riscv_vfmv_v_f_f32m4(0.0f, vl);
+            for (int64_t k = 0; k < K; ++k) {
+                const auto bf16_vec = __riscv_vle16_v_u16m2(
+                    reinterpret_cast<const uint16_t*>(
+                        B + k * ldb + (n + j) * ldb_col), vl);
+                auto bits_vec = __riscv_vzext_vf2_u32m4(bf16_vec, vl);
+                bits_vec = __riscv_vsll_vx_u32m4(bits_vec, 16, vl);
+                const auto weight_vec =
+                    __riscv_vreinterpret_v_u32m4_f32m4(bits_vec);
+                acc_vec = __riscv_vfmacc_vf_f32m4(
+                    acc_vec, static_cast<float>(A[k]) * {{alpha}}, weight_vec, vl);
+            }
+            __riscv_vse32_v_f32m4(C + n + j, acc_vec, vl);
+            j += static_cast<int64_t>(vl);
+        }
+    }
+}
+"""
+
+    def get_kernel_extra_args_declare(self) -> str:
+        return "int64_t ldb_col,\n"
+
+    def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        kernel = kwargs["kernel"]
+        B = kwargs["B"]
+        return [f"{kernel.stride(B, 1)},"]
+
+    def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        options = {
+            "declare_kernel": self.get_kernel_declaration(),
+            "kernel": kernel,
+            "block_n": self.register_blocking.block_n,
+            **self.get_common_options(),
+        }
+        return "#include <riscv_vector.h>\n" + KernelTemplate._template_from_string(
+            self.TEMPLATE_ENTRY
+        ).render(options)
+
+
+@register_micro_gemm(
+    *generate_gemm_config(
+        VecRVV,
+        [(4, 32, 1)],
+        input_dtype=torch.bfloat16,
+        input2_dtype=torch.bfloat16,
+        output_dtype=torch.float,
+        compute_dtype=torch.float,
+        extra_check=check_rvv_bf16_m_ge_2,
+    ),
+)
+class CppMicroGemmRVVBF16MGe2(CppMicroGemm):
+    TEMPLATE_ENTRY = r"""
+{{declare_kernel}} {
+    constexpr int64_t BLOCK_M = {{block_m}};
+    constexpr int64_t BLOCK_N = {{block_n}};
+
+    auto load_bf16_as_f32 = [](const {{input_t}}* ptr, size_t vl) {
+        const auto bf16_vec = __riscv_vle16_v_u16m2(
+            reinterpret_cast<const uint16_t*>(ptr), vl);
+        auto bits_vec = __riscv_vzext_vf2_u32m4(bf16_vec, vl);
+        bits_vec = __riscv_vsll_vx_u32m4(bits_vec, 16, vl);
+        return __riscv_vreinterpret_v_u32m4_f32m4(bits_vec);
+    };
+
+    if (ldb_col != 1) {
+        for (int64_t m = 0; m < M; ++m) {
+            for (int64_t n = 0; n < N; ++n) {
+                vfloat32m4_t acc_vec = __riscv_vfmv_v_f_f32m4(
+                    0.0f, __riscv_vsetvlmax_e32m4());
+                for (int64_t k = 0; k < K;) {
+                    const size_t vl = __riscv_vsetvl_e32m4(K - k);
+                    const auto a_vec = load_bf16_as_f32(A + m * lda + k, vl);
+                    const auto b_vec = load_bf16_as_f32(
+                        B + k * ldb + n * ldb_col, vl);
+                    acc_vec =
+                        __riscv_vfmacc_vv_f32m4_tu(acc_vec, a_vec, b_vec, vl);
+                    k += static_cast<int64_t>(vl);
+                }
+                vfloat32m1_t sum_vec = __riscv_vfmv_v_f_f32m1(
+                    0.0f, __riscv_vsetvlmax_e32m1());
+                sum_vec = __riscv_vfredusum_vs_f32m4_f32m1(
+                    acc_vec, sum_vec, __riscv_vsetvlmax_e32m4());
+                const float acc = __riscv_vfmv_f_s_f32m1_f32(sum_vec) * {{alpha}};
+                C[m * ldc + n] = accum ? C[m * ldc + n] + acc : acc;
+            }
+        }
+        return;
+    }
+
+    for (int64_t m = 0; m < M; m += BLOCK_M) {
+        const int64_t m_size = std::min<int64_t>(BLOCK_M, M - m);
+        for (int64_t n = 0; n < N; n += BLOCK_N) {
+            const int64_t n_size = std::min<int64_t>(BLOCK_N, N - n);
+            for (int64_t j = 0; j < n_size;) {
+                const size_t vl = __riscv_vsetvl_e32m4(n_size - j);
+                vfloat32m4_t acc0 = accum
+                    ? __riscv_vle32_v_f32m4(C + (m + 0) * ldc + n + j, vl)
+                    : __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                vfloat32m4_t acc1 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                vfloat32m4_t acc2 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                vfloat32m4_t acc3 = __riscv_vfmv_v_f_f32m4(0.0f, vl);
+                if constexpr (BLOCK_M > 1) {
+                    if (m_size > 1 && accum) {
+                        acc1 = __riscv_vle32_v_f32m4(C + (m + 1) * ldc + n + j, vl);
+                    }
+                    if (m_size > 2 && accum) {
+                        acc2 = __riscv_vle32_v_f32m4(C + (m + 2) * ldc + n + j, vl);
+                    }
+                    if (m_size > 3 && accum) {
+                        acc3 = __riscv_vle32_v_f32m4(C + (m + 3) * ldc + n + j, vl);
+                    }
+                }
+
+                for (int64_t k = 0; k < K; ++k) {
+                    const auto weight_vec = load_bf16_as_f32(
+                        B + k * ldb + (n + j) * ldb_col, vl);
+                    acc0 = __riscv_vfmacc_vf_f32m4(
+                        acc0,
+                        static_cast<float>(A[(m + 0) * lda + k]) * {{alpha}},
+                        weight_vec,
+                        vl);
+                    if constexpr (BLOCK_M > 1) {
+                        if (m_size > 1) {
+                            acc1 = __riscv_vfmacc_vf_f32m4(
+                                acc1,
+                                static_cast<float>(A[(m + 1) * lda + k]) * {{alpha}},
+                                weight_vec,
+                                vl);
+                        }
+                        if (m_size > 2) {
+                            acc2 = __riscv_vfmacc_vf_f32m4(
+                                acc2,
+                                static_cast<float>(A[(m + 2) * lda + k]) * {{alpha}},
+                                weight_vec,
+                                vl);
+                        }
+                        if (m_size > 3) {
+                            acc3 = __riscv_vfmacc_vf_f32m4(
+                                acc3,
+                                static_cast<float>(A[(m + 3) * lda + k]) * {{alpha}},
+                                weight_vec,
+                                vl);
+                        }
+                    }
+                }
+
+                __riscv_vse32_v_f32m4(C + (m + 0) * ldc + n + j, acc0, vl);
+                if constexpr (BLOCK_M > 1) {
+                    if (m_size > 1) {
+                        __riscv_vse32_v_f32m4(C + (m + 1) * ldc + n + j, acc1, vl);
+                    }
+                    if (m_size > 2) {
+                        __riscv_vse32_v_f32m4(C + (m + 2) * ldc + n + j, acc2, vl);
+                    }
+                    if (m_size > 3) {
+                        __riscv_vse32_v_f32m4(C + (m + 3) * ldc + n + j, acc3, vl);
+                    }
+                }
+                j += static_cast<int64_t>(vl);
+            }
+        }
+    }
+}
+"""
+
+    def get_kernel_extra_args_declare(self) -> str:
+        return "int64_t ldb_col,\n"
+
+    def get_kernel_extra_args(self, **kwargs) -> list[str]:
+        kernel = kwargs["kernel"]
+        B = kwargs["B"]
+        return [f"{kernel.stride(B, 1)},"]
+
+    def codegen_define(self, kernel: CppTemplateKernel) -> str:
+        options = {
+            "declare_kernel": self.get_kernel_declaration(),
+            "kernel": kernel,
+            "block_m": self.register_blocking.block_m,
+            "block_n": self.register_blocking.block_n,
+            **self.get_common_options(),
+        }
+        return "#include <riscv_vector.h>\n" + KernelTemplate._template_from_string(
+            self.TEMPLATE_ENTRY
+        ).render(options)
 
 
 def check_vnni_extra(config, m, n, k, alpha, num_threads, **kwargs):

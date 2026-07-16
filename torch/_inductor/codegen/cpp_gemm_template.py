@@ -3,8 +3,10 @@ import contextlib
 import logging
 import math
 import os
+import platform
 from collections.abc import Callable
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, cast, TypeVar
 from unittest.mock import patch
 
@@ -29,6 +31,8 @@ from .cpp_micro_gemm import (
     CppMicroGemm,
     CppMicroGemmAMX,
     CppMicroGemmFP32Vec,
+    CppMicroGemmRVVBF16MGe2,
+    CppMicroGemmRVVBF16M1,
     create_micro_gemm,
     is_int8_woq_gemm_small_m_dim_corner_case,
     LayoutType,
@@ -44,6 +48,54 @@ from .cpp_utils import (
 
 
 log = logging.getLogger(__name__)
+
+
+def _parse_sysfs_cache_size(value: str) -> int:
+    value = value.strip().upper()
+    multipliers = {"K": 1024, "M": 1024 * 1024}
+    if value[-1:] in multipliers:
+        return int(value[:-1]) * multipliers[value[-1]]
+    return int(value)
+
+
+def _read_riscv_sysfs_cache_sizes(
+    cpu_root: Path = Path("/sys/devices/system/cpu"),
+) -> tuple[int, int]:
+    cache_sizes: dict[int, list[int]] = {1: [], 2: []}
+    for cache_dir in cpu_root.glob("cpu[0-9]*/cache/index*"):
+        try:
+            level = int((cache_dir / "level").read_text().strip())
+            cache_type = (cache_dir / "type").read_text().strip()
+            cache_size = _parse_sysfs_cache_size((cache_dir / "size").read_text())
+        except (OSError, ValueError):
+            continue
+        if level in cache_sizes and cache_type in ("Data", "Unified"):
+            cache_sizes[level].append(cache_size)
+    return (
+        min(cache_sizes[1], default=0),
+        min(cache_sizes[2], default=0),
+    )
+
+
+@lru_cache
+def get_cpu_cache_sizes() -> tuple[int, int]:
+    capabilities = torch.cpu.get_capabilities()
+    l1d_cache_size = capabilities.get("l1d_cache_size", 0)
+    l2_cache_size = capabilities.get("l2_cache_size", 0)
+    if l1d_cache_size > 0 and l2_cache_size > 0:
+        return l1d_cache_size, l2_cache_size
+
+    if platform.machine() not in ("riscv64", "riscv"):
+        return l1d_cache_size, l2_cache_size
+
+    sysfs_l1d_cache_size, sysfs_l2_cache_size = _read_riscv_sysfs_cache_sizes()
+    if l1d_cache_size <= 0:
+        l1d_cache_size = sysfs_l1d_cache_size
+    if l2_cache_size <= 0:
+        l2_cache_size = sysfs_l2_cache_size
+
+    return l1d_cache_size, l2_cache_size
+
 
 GEMM_TEMPLATE_INIT_BLOCKING_BASIC_BLOCK = r"""
     constexpr int64_t num_threads = {{num_threads}};
@@ -825,18 +877,13 @@ class CppGemmTemplate(CppTemplate):
             L1_limit_factor = 0.8
             L2_limit_factor = 0.5
 
-            L1_cache_size = torch.cpu.get_capabilities().get(
-                "l1d_cache_size", 0
-            )  # per core cache size in Bytes
+            L1_cache_size, L2_cache_size = get_cpu_cache_sizes()
             if L1_cache_size <= 0:
                 raise AssertionError(
                     f"Expect L1_cache_size > 0 but got {L1_cache_size}"
                 )
             L1 = L1_cache_size * L1_limit_factor
 
-            L2_cache_size = torch.cpu.get_capabilities().get(
-                "l2_cache_size", 0
-            )  # per core cache size in Bytes
             if L2_cache_size <= 0:
                 raise AssertionError(
                     f"Expect L2_cache_size > 0 but got {L2_cache_size}"
@@ -1343,6 +1390,8 @@ class CppGemmTemplate(CppTemplate):
 
     @staticmethod
     def check_if_block_weight(W, micro_gemm):
+        if isinstance(micro_gemm, (CppMicroGemmRVVBF16M1, CppMicroGemmRVVBF16MGe2)):
+            return W.get_name() in V.graph.constants
         return True
 
     @classmethod
@@ -1690,15 +1739,10 @@ class CppGemmTemplate(CppTemplate):
         if isinstance(micro_gemm, CppMicroBrgemm):
             counters["inductor"]["cpp_micro_brgemm_counter"] += 1
 
-        L1_cache_size = torch.cpu.get_capabilities().get(
-            "l1d_cache_size", 0
-        )  # per core cache size in Bytes
+        L1_cache_size, L2_cache_size = get_cpu_cache_sizes()
         if L1_cache_size <= 0:
             raise AssertionError(f"Expect L1_cache_size > 0 but got {L1_cache_size}")
 
-        L2_cache_size = torch.cpu.get_capabilities().get(
-            "l2_cache_size", 0
-        )  # per core cache size in Bytes
         if L2_cache_size <= 0:
             raise AssertionError(f"Expect L2_cache_size > 0 but got {L2_cache_size}")
 
