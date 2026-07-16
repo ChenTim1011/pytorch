@@ -2894,6 +2894,15 @@ class CPUReproTests(TestCase):
             ("prefill_o_proj", 64, 2048, 2048, CppMicroGemmRVVBF16MGe2, (4, 32, 1)),
             ("prefill_gate_up", 64, 16384, 2048, CppMicroGemmRVVBF16MGe2, (4, 32, 1)),
             ("prefill_down", 64, 2048, 8192, CppMicroGemmRVVBF16MGe2, (4, 32, 1)),
+            ("prefill128_qkv", 128, 3072, 2048, CppMicroGemmRVVBF16MGe2, (4, 32, 1)),
+            (
+                "prefill128_gate_up",
+                128,
+                16384,
+                2048,
+                CppMicroGemmRVVBF16MGe2,
+                (4, 32, 1),
+            ),
             ("decode_qkv", 1, 3072, 2048, CppMicroGemmRVVBF16M1, (1, 32, 1)),
             ("decode_o_proj", 1, 2048, 2048, CppMicroGemmRVVBF16M1, (1, 32, 1)),
             ("decode_gate_up", 1, 16384, 2048, CppMicroGemmRVVBF16M1, (1, 32, 1)),
@@ -2937,6 +2946,284 @@ class CPUReproTests(TestCase):
                     if expected_cls is CppMicroGemmRVVBF16M1:
                         self.assertIn("CppMicroGemmRVVBF16M1 requires M=1", source)
                         self.assertIn("__riscv_vfmacc_vv_f32m4_tu", source)
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "freezing": True,
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    def test_rvv_bf16_micro_gemm_without_cpp_autotune_backend(self):
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        class LinearMM(nn.Module):
+            def __init__(self, n: int, k: int) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(n, k, dtype=torch.bfloat16))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.mm(x, self.weight.t())
+
+        model = LinearMM(3072, 2048).eval()
+        x = torch.randn(1, 2048, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            expected = model(x)
+            actual, code = run_and_get_cpp_code(
+                torch.compile(model, backend="inductor", fullgraph=True), x
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        FileCheck().check("#include <riscv_vector.h>").check(
+            "kernel_micro_gemm"
+        ).check("__riscv_vsetvl").check("__riscv_vle16").check(
+            "__riscv_vfmacc"
+        ).check_not(
+            "extern_kernels.mm"
+        ).run(
+            code
+        )
+
+        torch._dynamo.reset()
+        small_model = LinearMM(64, 64).eval()
+        small_x = torch.randn(1, 64, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            _, small_code = run_and_get_cpp_code(
+                torch.compile(small_model, backend="inductor", fullgraph=True),
+                small_x,
+            )
+        FileCheck().check_not("kernel_micro_gemm").check_not(
+            "#include <riscv_vector.h>"
+        ).run(small_code)
+
+    def test_rvv_bf16_template_profitability_boundaries(self):
+        from torch._inductor.utils import _is_profitable_rvv_bf16_template_shape
+
+        self.assertTrue(
+            _is_profitable_rvv_bf16_template_shape(1, 1024, 1024, 1_048_576)
+        )
+        self.assertTrue(
+            _is_profitable_rvv_bf16_template_shape(128, 1024, 1024, 134_217_728)
+        )
+        self.assertFalse(
+            _is_profitable_rvv_bf16_template_shape(129, 1024, 1024, 135_266_304)
+        )
+        self.assertFalse(
+            _is_profitable_rvv_bf16_template_shape(1, 1023, 1024, 1_047_552)
+        )
+        self.assertFalse(
+            _is_profitable_rvv_bf16_template_shape(1, 1024, 1023, 1_047_552)
+        )
+        self.assertFalse(
+            _is_profitable_rvv_bf16_template_shape(1, 1024, 1024, 999_999)
+        )
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    def test_rvv_bf16_linear_runtime_weight_reuse(self):
+        from torch._dynamo.testing import CompileCounterWithBackend
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return F.linear(x, weight, None)
+
+        counter = CompileCounterWithBackend("inductor")
+        opt_linear = torch.compile(
+            linear, backend=counter, dynamic=False, fullgraph=True
+        )
+        x = torch.randn(16, 1024, dtype=torch.bfloat16)
+        weights = [
+            nn.Parameter(torch.randn(1024, 1024, dtype=torch.bfloat16))
+            for _ in range(3)
+        ]
+
+        with torch.inference_mode():
+            for weight in weights:
+                actual = opt_linear(x, weight)
+                expected = linear(x, weight)
+                torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1.0)
+
+        self.assertEqual(counter.frame_count, 1)
+
+        torch._dynamo.reset()
+        with torch.inference_mode():
+            _, code = run_and_get_cpp_code(
+                torch.compile(linear, backend="inductor", fullgraph=True),
+                x,
+                weights[0],
+            )
+        FileCheck().check("#include <riscv_vector.h>").check(
+            "kernel_micro_gemm"
+        ).check("__riscv_vsetvl").check("load_bf16_as_f32").check(
+            "__riscv_vfmacc"
+        ).check_not(
+            "extern_kernels.mm"
+        ).run(
+            code
+        )
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    @torch._dynamo.config.patch("inline_single_use_invoke_subgraph", False)
+    def test_rvv_bf16_linear_nested_compile_region(self):
+        from torch._dynamo.testing import CompileCounterWithBackend
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        @torch.compiler.nested_compile_region
+        def linear_region(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return F.linear(x, weight, None)
+
+        def model(
+            x: torch.Tensor,
+            w0: torch.Tensor,
+            w1: torch.Tensor,
+            w2: torch.Tensor,
+        ) -> torch.Tensor:
+            return (
+                linear_region(x, w0)
+                + linear_region(x, w1)
+                + linear_region(x, w2)
+            )
+
+        x = torch.randn(16, 1024, dtype=torch.bfloat16)
+        weights = [
+            nn.Parameter(torch.randn(1024, 1024, dtype=torch.bfloat16))
+            for _ in range(3)
+        ]
+
+        counter = CompileCounterWithBackend("inductor")
+        opt_model = torch.compile(model, backend=counter, dynamic=False, fullgraph=True)
+        with torch.inference_mode():
+            actual = opt_model(x, *weights)
+            expected = model(x, *weights)
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=3.0)
+
+        self.assertEqual(counter.frame_count, 1)
+
+        torch._dynamo.reset()
+        with torch.inference_mode():
+            _, code = run_and_get_cpp_code(
+                torch.compile(model, backend="inductor", fullgraph=True),
+                x,
+                *weights,
+            )
+        FileCheck().check("#include <riscv_vector.h>").check(
+            "kernel_micro_gemm"
+        ).check("__riscv_vsetvl").check("load_bf16_as_f32").check(
+            "__riscv_vfmacc"
+        ).check_not(
+            "extern_kernels.mm"
+        ).run(
+            code
+        )
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    @torch._dynamo.config.patch("inline_single_use_invoke_subgraph", False)
+    def test_rvv_bf16_representative_linear_buckets(self):
+        from torch._dynamo.testing import CompileCounterWithBackend
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        @torch.compiler.nested_compile_region
+        def linear_region(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return F.linear(x, weight, None)
+
+        def repeated_linear_model(
+            x: torch.Tensor,
+            w0: torch.Tensor,
+            w1: torch.Tensor,
+        ) -> torch.Tensor:
+            return linear_region(x, w0) + linear_region(x, w1)
+
+        representative_buckets = [
+            ("decode_m1_qkv", 1, 3072, 2048, 2e-2, 4.0),
+            ("prefill_m64_qkv", 64, 3072, 2048, 2e-2, 4.0),
+            ("prefill_m128_qkv", 128, 3072, 2048, 2e-2, 4.0),
+        ]
+
+        for name, m, n, k, rtol, atol in representative_buckets:
+            with self.subTest(name=name):
+                torch._dynamo.reset()
+                x = torch.randn(m, k, dtype=torch.bfloat16)
+                weights = [
+                    nn.Parameter(torch.randn(n, k, dtype=torch.bfloat16))
+                    for _ in range(2)
+                ]
+
+                counter = CompileCounterWithBackend("inductor")
+                opt_model = torch.compile(
+                    repeated_linear_model,
+                    backend=counter,
+                    dynamic=False,
+                    fullgraph=True,
+                )
+                with torch.inference_mode():
+                    actual = opt_model(x, *weights)
+                    expected = repeated_linear_model(x, *weights)
+                    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+                self.assertEqual(counter.frame_count, 1)
+
+                torch._dynamo.reset()
+                with torch.inference_mode():
+                    _, code = run_and_get_cpp_code(
+                        torch.compile(
+                            repeated_linear_model,
+                            backend="inductor",
+                            fullgraph=True,
+                        ),
+                        x,
+                        *weights,
+                    )
+                FileCheck().check("#include <riscv_vector.h>").check(
+                    "kernel_micro_gemm"
+                ).check("__riscv_vsetvl").check("load_bf16_as_f32").check(
+                    "__riscv_vfmacc"
+                ).check_not(
+                    "extern_kernels.mm"
+                ).run(
+                    code
+                )
 
     @unittest.skipIf(IS_FBCODE, "Not yet runnable in fbcode")
     @unittest.skipIf(

@@ -44,6 +44,8 @@ def get_restrict_keyword() -> str:
 
 
 class CppMicroGemm:
+    supports_runtime_weight = False
+
     """
     A class that codegens a kernel that computes small-sized matrix multiplication.
 
@@ -1002,6 +1004,8 @@ inline void {{kernel_name}}_transpose_b_kernel(
     ),
 )
 class CppMicroGemmRVVBF16M1(CppMicroGemm):
+    supports_runtime_weight = True
+
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {
     {{kernel.assert_function}}(M == 1, "CppMicroGemmRVVBF16M1 requires M=1");
@@ -1112,6 +1116,8 @@ class CppMicroGemmRVVBF16M1(CppMicroGemm):
     ),
 )
 class CppMicroGemmRVVBF16MGe2(CppMicroGemm):
+    supports_runtime_weight = True
+
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {
     constexpr int64_t BLOCK_M = {{block_m}};
