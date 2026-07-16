@@ -84,7 +84,7 @@ from torch._inductor.cpp_builder import (
     normalize_path_separator,
     run_asm_build_object,
 )
-from torch._inductor.cpu_vec_isa import invalid_vec_isa, pick_vec_isa
+from torch._inductor.cpu_vec_isa import VecRVV, invalid_vec_isa, pick_vec_isa
 from torch._inductor.custom_graph_pass import (
     CustomGraphModulePass,
     CustomGraphPass,
@@ -3776,6 +3776,14 @@ def _resolve_needs_vec_isa(
     return any(marker in source for marker in _VEC_ISA_CPP_SOURCE_MARKERS)
 
 
+def _should_use_cpp_cache_precompiled_headers() -> bool:
+    return (
+        config.cpp_cache_precompile_headers
+        and not _IS_WINDOWS
+        and not isinstance(pick_vec_isa(), VecRVV)
+    )
+
+
 @clear_on_fresh_cache
 class CppCodeCache:
     """Compiles and caches C++ libraries.  Users of this class supply the source code to
@@ -3912,8 +3920,9 @@ class CppCodeCache:
             future: Future[Any] | None = None
             lib = None
 
-            # if requested, pre-compile any headers
-            if config.cpp_cache_precompile_headers and not _IS_WINDOWS:
+            # RVV kernels must parse the ATen RVV headers with the same
+            # architecture flags used by the optimized translation unit.
+            if _should_use_cpp_cache_precompiled_headers():
                 if header := cls._get_uncompiled_header(device_type):
                     main_build_option.precompiled_header = _precompile_header(
                         header,

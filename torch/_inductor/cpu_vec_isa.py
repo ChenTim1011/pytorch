@@ -226,7 +226,7 @@ cdll.LoadLibrary("__lib_path__")
         if config.is_fbcode():
             return True
 
-        return self.check_build(VecISA._avx_code)
+        return self.check_build(self._avx_code)
 
 
 @dataclasses.dataclass
@@ -487,6 +487,42 @@ class VecAVX2(VecISA):
 
 
 @dataclasses.dataclass
+class VecRVV(VecISA):
+    _bit_width = 256
+    _macro = [
+        "CPU_CAPABILITY_RVV",
+        "CPU_CAPABILITY=RVV",
+        "HAVE_RVV_CPU_DEFINITION",
+    ]
+    _arch_flags = "-march=rv64gcv_zvl128b"
+    _dtype_nelements = {torch.float: 8, torch.bfloat16: 16, torch.float16: 16}
+    # Basic RVV selection must not depend on optional transcendental/SLEEF
+    # coverage. Generated kernels that use those operations validate them.
+    _avx_code = """
+#if defined(CPU_CAPABILITY_RVV)
+#include <ATen/cpu/vec/functional.h>
+#include <ATen/cpu/vec/vec.h>
+#endif
+
+alignas(64) float in_out_ptr0[16] = {0.0};
+
+extern "C" void __avx_chk_kernel() {
+    auto tmp0 = at::vec::Vectorized<float>(1);
+    auto tmp1 = at::vec::Vectorized<float>(2);
+    auto tmp2 = at::vec::maximum(
+        tmp0 * tmp1 + tmp0 - tmp1,
+        at::vec::Vectorized<float>(0));
+    tmp2.store(in_out_ptr0);
+}
+"""
+
+    def __str__(self) -> str:
+        return "rvv"
+
+    __hash__: Callable[[VecISA], Any] = VecISA.__hash__  # type: ignore[assignment]
+
+
+@dataclasses.dataclass
 class VecZVECTOR(VecISA):
     _bit_width = 256
     _macro = [
@@ -568,6 +604,7 @@ supported_vec_isa_list = [
     VecAVX2(),
     VecNEON(),
     VecSVE(256),
+    VecRVV(),
 ]
 
 
@@ -583,6 +620,7 @@ def get_isa_from_cpu_capability(
         "default": "INVALID_VEC_ISA",
         "zvector": "zvector",
         "vsx": "vsx",
+        "rvv": "rvv",
         "avx2": "avx2",
         "avx512": "avx512",
     }
@@ -640,6 +678,10 @@ def valid_vec_isa_list() -> list[VecISA]:
                 isa_list.append(VecSVE(256))
         else:
             isa_list.append(VecNEON())
+    elif arch == "riscv64":
+        vec_rvv = VecRVV()
+        if torch.backends.cpu.get_cpu_capability() == "RVV" and vec_rvv:
+            isa_list.append(vec_rvv)
 
     elif arch in ["x86_64", "AMD64"]:
         """

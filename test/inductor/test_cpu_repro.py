@@ -17,7 +17,7 @@ from torch import nn
 from torch._C import FileCheck
 from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import same
-from torch._inductor import config, cpu_vec_isa, metrics, test_operators
+from torch._inductor import codecache, config, cpu_vec_isa, metrics, test_operators
 from torch._inductor.codegen.cpp import CppOverrides, CppVecOverrides
 from torch._inductor.compile_fx import compile_fx, compile_fx_inner
 from torch._inductor.exc import InductorError
@@ -2732,6 +2732,85 @@ class CPUReproTests(TestCase):
                 os.environ["ATEN_CPU_CAPABILITY"] = pre_var
             elif os.getenv("ATEN_CPU_CAPABILITY"):
                 os.environ.pop("ATEN_CPU_CAPABILITY")
+
+    @patch("torch.backends.cpu.get_cpu_capability", lambda: "RVV")
+    @patch("platform.machine", lambda: "riscv64")
+    @patch.object(cpu_vec_isa.VecRVV, "__bool__", lambda self: True)
+    def test_auto_rvv_simd(self):
+        cpu_vec_isa.valid_vec_isa_list.cache_clear()
+        self.addCleanup(cpu_vec_isa.valid_vec_isa_list.cache_clear)
+        vec_rvv = cpu_vec_isa.valid_vec_isa_list()[0]
+        self.assertIsInstance(vec_rvv, cpu_vec_isa.VecRVV)
+        self.assertEqual(vec_rvv.bit_width(), 256)
+        self.assertEqual(vec_rvv.nelements(), 8)
+        self.assertEqual(vec_rvv.nelements(torch.bfloat16), 16)
+        self.assertEqual(
+            vec_rvv.build_macro(),
+            [
+                "CPU_CAPABILITY_RVV",
+                "CPU_CAPABILITY=RVV",
+                "HAVE_RVV_CPU_DEFINITION",
+            ],
+        )
+        self.assertEqual(vec_rvv.build_arch_flags(), "-march=rv64gcv_zvl128b")
+        self.assertIn(".exp()", cpu_vec_isa.VecISA._avx_code)
+        self.assertNotIn(".exp()", cpu_vec_isa.VecRVV._avx_code)
+        self.assertIn("CPU_CAPABILITY_RVV", cpu_vec_isa.VecRVV._avx_code)
+
+        with (
+            config.patch({"cpp_cache_precompile_headers": True}),
+            patch.object(codecache, "_IS_WINDOWS", False),
+            patch.object(codecache, "pick_vec_isa", return_value=vec_rvv),
+        ):
+            self.assertFalse(codecache._should_use_cpp_cache_precompiled_headers())
+
+        with config.patch({"cpp.simdlen": 0}):
+            isa = cpu_vec_isa.pick_vec_isa()
+            self.assertFalse(isa)
+
+        with config.patch({"cpp.simdlen": 1}):
+            isa = cpu_vec_isa.pick_vec_isa()
+            self.assertFalse(isa)
+
+        with config.patch({"cpp.simdlen": 257}):
+            isa = cpu_vec_isa.pick_vec_isa()
+            self.assertFalse(isa)
+
+        with config.patch({"cpp.simdlen": 256}):
+            isa = cpu_vec_isa.pick_vec_isa()
+            self.assertTrue(isa == vec_rvv)
+
+        with patch.dict(os.environ):
+            os.environ.pop("ATEN_CPU_CAPABILITY", None)
+            with config.patch({"cpp.simdlen": None}):
+                isa = cpu_vec_isa.pick_vec_isa()
+                self.assertEqual(isa, vec_rvv)
+
+            with config.patch({"cpp.simdlen": None}):
+                os.environ["ATEN_CPU_CAPABILITY"] = "rvv"
+                isa = cpu_vec_isa.pick_vec_isa()
+                self.assertEqual(isa, vec_rvv)
+
+            with config.patch({"cpp.simdlen": None}):
+                os.environ["ATEN_CPU_CAPABILITY"] = "default"
+                isa = cpu_vec_isa.pick_vec_isa()
+                self.assertFalse(isa)
+
+            with config.patch({"cpp.simdlen": None}):
+                os.environ["ATEN_CPU_CAPABILITY"] = "avx2"
+                isa = cpu_vec_isa.pick_vec_isa()
+                self.assertEqual(isa, vec_rvv)
+
+    @patch("torch.backends.cpu.get_cpu_capability", lambda: "RVV")
+    @patch("platform.machine", lambda: "riscv64")
+    @patch.object(cpu_vec_isa.VecRVV, "__bool__", lambda self: False)
+    def test_auto_rvv_simd_dry_build_failure(self):
+        cpu_vec_isa.valid_vec_isa_list.cache_clear()
+        try:
+            self.assertEqual(cpu_vec_isa.valid_vec_isa_list(), [])
+            self.assertFalse(cpu_vec_isa.pick_vec_isa())
+        finally:
+            cpu_vec_isa.valid_vec_isa_list.cache_clear()
 
     @unittest.skipIf(IS_FBCODE, "Not yet runnable in fbcode")
     @unittest.skipIf(
