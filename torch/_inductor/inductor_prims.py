@@ -197,6 +197,100 @@ force_stride_order = make_prim(
     eager_force_stride,
     doc="Force the stride order for input tensor. No-op if the input tensor already has the stride. Do a copy otherwise",
 )
+
+
+RVV_BF16_PACKED_WEIGHT_BLOCK_N = 32
+RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION = 1
+
+
+def _check_rvv_bf16_packed_weight_layout_version(layout_version: int) -> None:
+    torch._check(
+        layout_version == RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION,
+        lambda: (
+            "unsupported RVV packed weight layout version: "
+            f"expected {RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION}, got {layout_version}"
+        ),
+    )
+
+
+def eager_rvv_pack_bf16_weight(
+    weight: Tensor,
+    layout_version: int = RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION,
+) -> Tensor:
+    _check_rvv_bf16_packed_weight_layout_version(layout_version)
+    torch._check(weight.dim() == 2, lambda: "RVV weight must be two-dimensional")
+    torch._check(
+        weight.dtype == torch.bfloat16,
+        lambda: "RVV packed linear requires a BF16 weight",
+    )
+    n, k = weight.shape
+    block_n = RVV_BF16_PACKED_WEIGHT_BLOCK_N
+    padded_n = (n + block_n - 1) // block_n * block_n
+    padded_weight = torch.nn.functional.pad(weight, (0, 0, 0, padded_n - n))
+    return (
+        padded_weight.reshape(padded_n // block_n, block_n, k)
+        .permute(0, 2, 1)
+        .contiguous()
+    )
+
+
+def eager_rvv_packed_bf16_linear(
+    input: Tensor,
+    packed_weight: Tensor,
+    out_features: int,
+    layout_version: int = RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION,
+) -> Tensor:
+    _check_rvv_bf16_packed_weight_layout_version(layout_version)
+    torch._check(input.dim() == 2, lambda: "RVV packed linear requires a 2D input")
+    torch._check(
+        packed_weight.dim() == 3,
+        lambda: "RVV packed weight must have [N-block, K, block-N] layout",
+    )
+    torch._check(
+        input.dtype == torch.bfloat16 and packed_weight.dtype == torch.bfloat16,
+        lambda: "RVV packed linear requires BF16 inputs",
+    )
+    n_blocks, k, block_n = packed_weight.shape
+    torch._check(
+        block_n == RVV_BF16_PACKED_WEIGHT_BLOCK_N,
+        lambda: "RVV packed weight layout requires block-N=32",
+    )
+    torch._check(
+        packed_weight.is_contiguous(),
+        lambda: "RVV packed weight must be contiguous",
+    )
+    torch._check(
+        input.shape[1] == k,
+        lambda: "input K must match the RVV packed weight K",
+    )
+    torch._check(out_features > 0, lambda: "out_features must be positive")
+    torch._check(
+        out_features <= n_blocks * block_n,
+        lambda: "out_features exceeds the RVV packed weight capacity",
+    )
+    weight = packed_weight.permute(0, 2, 1).reshape(n_blocks * block_n, k)
+    return torch.nn.functional.linear(input, weight[:out_features])
+
+
+rvv_pack_bf16_weight = make_prim(
+    "rvv_pack_bf16_weight(Tensor weight, int layout_version=1) -> Tensor",
+    eager_rvv_pack_bf16_weight,
+    doc=(
+        "Pack a BF16 [N, K] weight into the runtime-only RVV layout v1 "
+        "[ceil(N / 32), K, 32]. Packed tensors are not a stable serialization "
+        "format and must be rebuilt by the owning runtime after loading."
+    ),
+)
+
+rvv_packed_bf16_linear = make_prim(
+    "rvv_packed_bf16_linear(Tensor input, Tensor packed_weight, SymInt out_features, int layout_version=1) -> Tensor",
+    eager_rvv_packed_bf16_linear,
+    doc=(
+        "Compute BF16 linear from an explicitly owned, contiguous RVV packed "
+        "weight tensor using runtime layout v1."
+    ),
+)
+
 _unsafe_index_put_ = make_prim(
     "_unsafe_index_put_(Tensor(a!) self, Tensor?[] indices, Tensor values, bool accumulate=False) -> Tensor(a!)",
     lambda self, indices, values, accumulate=False: torch.ops.aten.index_put_(

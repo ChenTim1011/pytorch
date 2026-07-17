@@ -1019,6 +1019,60 @@ class CppGemmTemplate(CppTemplate):
         return k_blocks > thread_blocking.block_k
 
     @classmethod
+    def add_explicit_packed_rvv_choices(cls, choices, layout, input_nodes):
+        if len(input_nodes) != 2:
+            raise AssertionError("explicit RVV packed GEMM expects input and weight")
+
+        x, packed_weight = input_nodes
+        m, n = layout.size[-2:]
+        k = x.get_size()[-1]
+        packed_size = packed_weight.get_size()
+        if len(packed_size) != 3:
+            raise AssertionError(
+                "explicit RVV packed weight must have [N-block, K, block-N] layout"
+            )
+
+        num_threads = parallel_num_threads()
+        output_dtype, compute_dtype = get_gemm_template_output_and_compute_dtype(
+            x.get_dtype()
+        )
+        micro_gemm = create_micro_gemm(
+            "micro_gemm",
+            m,
+            n,
+            k,
+            input_dtype=x.get_dtype(),
+            input2_dtype=packed_weight.get_dtype(),
+            output_dtype=output_dtype,
+            compute_dtype=compute_dtype,
+            alpha=1,
+            num_threads=num_threads,
+            use_ref=False,
+        )
+        if not isinstance(
+            micro_gemm, (CppMicroGemmRVVBF16M1, CppMicroGemmRVVBF16MGe2)
+        ):
+            raise AssertionError("explicit packed GEMM requires an RVV BF16 microkernel")
+
+        block_n = micro_gemm.register_blocking.block_n
+        expected_size = [get_padded_n(n, block_n) // block_n, k, block_n]
+        if packed_size != expected_size:
+            raise AssertionError(
+                f"expected RVV packed weight size {expected_size}, got {packed_size}"
+            )
+
+        micro_gemm.use_local_vnni_blocking(False)
+        template = cls(
+            input_nodes=input_nodes,
+            layout=layout,
+            num_threads=num_threads,
+            register_blocking=micro_gemm.register_blocking,
+            should_block_weights=True,
+            name=micro_gemm.__class__.__name__,
+        )
+        template.maybe_append_choice(choices)
+
+    @classmethod
     def add_choices(
         cls,
         choices,

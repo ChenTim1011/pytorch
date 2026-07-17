@@ -2947,6 +2947,64 @@ class CPUReproTests(TestCase):
                         self.assertIn("CppMicroGemmRVVBF16M1 requires M=1", source)
                         self.assertIn("__riscv_vfmacc_vv_f32m4_tu", source)
 
+    def test_rvv_bf16_explicit_packed_primitive_contract(self):
+        from torch._inductor import inductor_prims
+        from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+        n, k = 33, 64
+        weight = torch.randn(n, k, dtype=torch.bfloat16)
+        packed_weight = inductor_prims.rvv_pack_bf16_weight(weight)
+        self.assertEqual(packed_weight.shape, (2, k, 32))
+        self.assertEqual(inductor_prims.RVV_BF16_PACKED_WEIGHT_BLOCK_N, 32)
+        self.assertEqual(inductor_prims.RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION, 1)
+
+        with self.assertRaisesRegex(RuntimeError, "layout version"):
+            inductor_prims.rvv_pack_bf16_weight(weight, layout_version=2)
+
+        input = torch.randn(2, k, dtype=torch.bfloat16)
+        actual = inductor_prims.rvv_packed_bf16_linear(input, packed_weight, n)
+        torch.testing.assert_close(actual, F.linear(input, weight))
+        with self.assertRaisesRegex(RuntimeError, "layout version"):
+            inductor_prims.rvv_packed_bf16_linear(
+                input, packed_weight, n, layout_version=2
+            )
+
+        with FakeTensorMode():
+            fake_weight = torch.empty(n, k, dtype=torch.bfloat16)
+            fake_packed = inductor_prims.rvv_pack_bf16_weight(fake_weight)
+            fake_output = inductor_prims.rvv_packed_bf16_linear(
+                torch.empty(2, k, dtype=torch.bfloat16), fake_packed, n
+            )
+        self.assertIsInstance(fake_packed, FakeTensor)
+        self.assertEqual(fake_packed.shape, (2, k, 32))
+        self.assertEqual(fake_output.shape, (2, n))
+
+        with self.assertRaisesRegex(RuntimeError, "two-dimensional"):
+            inductor_prims.rvv_pack_bf16_weight(weight[0])
+        with self.assertRaisesRegex(RuntimeError, "BF16 weight"):
+            inductor_prims.rvv_pack_bf16_weight(weight.float())
+        with self.assertRaisesRegex(RuntimeError, "2D input"):
+            inductor_prims.rvv_packed_bf16_linear(
+                input.unsqueeze(0), packed_weight, n
+            )
+        with self.assertRaisesRegex(RuntimeError, "block-N=32"):
+            inductor_prims.rvv_packed_bf16_linear(
+                input, torch.empty(2, k, 16, dtype=torch.bfloat16), n
+            )
+        noncontiguous_packed = packed_weight.transpose(1, 2).contiguous().transpose(1, 2)
+        with self.assertRaisesRegex(RuntimeError, "must be contiguous"):
+            inductor_prims.rvv_packed_bf16_linear(
+                input, noncontiguous_packed, n
+            )
+        with self.assertRaisesRegex(RuntimeError, "BF16 inputs"):
+            inductor_prims.rvv_packed_bf16_linear(input.float(), packed_weight, n)
+        with self.assertRaisesRegex(RuntimeError, "input K"):
+            inductor_prims.rvv_packed_bf16_linear(input[:, :-1], packed_weight, n)
+        with self.assertRaisesRegex(RuntimeError, "positive"):
+            inductor_prims.rvv_packed_bf16_linear(input, packed_weight, 0)
+        with self.assertRaisesRegex(RuntimeError, "capacity"):
+            inductor_prims.rvv_packed_bf16_linear(input, packed_weight, 65)
+
     @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
     @config.patch(
         {
@@ -3074,6 +3132,127 @@ class CPUReproTests(TestCase):
             "kernel_micro_gemm"
         ).check("__riscv_vsetvl").check("load_bf16_as_f32").check(
             "__riscv_vfmacc"
+        ).check_not(
+            "extern_kernels.mm"
+        ).run(
+            code
+        )
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    def test_rvv_bf16_explicit_packed_linear_m1(self):
+        from torch._dynamo.testing import CompileCounterWithBackend
+        from torch._inductor import inductor_prims
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        n, k = 64, 128
+        x = torch.randn(1, k, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, dtype=torch.bfloat16)
+        weight_before = weight.clone()
+        token_ids = torch.tensor([0, 7, n - 1])
+        embedding_before = F.embedding(token_ids, weight)
+        weight_data_ptr = weight.data_ptr()
+        packed_weight = inductor_prims.rvv_pack_bf16_weight(weight)
+
+        self.assertEqual(packed_weight.shape, (2, k, 32))
+        self.assertTrue(packed_weight.is_contiguous())
+        self.assertNotEqual(packed_weight.data_ptr(), weight.data_ptr())
+        self.assertEqual(weight.data_ptr(), weight_data_ptr)
+        self.assertEqual(weight, weight_before)
+        self.assertEqual(F.embedding(token_ids, weight), embedding_before)
+
+        def packed_linear(
+            inp: torch.Tensor, packed: torch.Tensor
+        ) -> torch.Tensor:
+            return inductor_prims.rvv_packed_bf16_linear(inp, packed, n)
+
+        with torch.inference_mode():
+            expected = F.linear(x, weight)
+            eager_actual = packed_linear(x, packed_weight)
+            actual, code = run_and_get_cpp_code(
+                torch.compile(packed_linear, backend="inductor", fullgraph=True),
+                x,
+                packed_weight,
+            )
+
+        torch.testing.assert_close(eager_actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        FileCheck().check("#include <riscv_vector.h>").check(
+            "CppMicroGemmRVVBF16M1 requires M=1"
+        ).check("__riscv_vfmacc").check_not("extern_kernels.mm").run(code)
+
+        other_weight = torch.randn_like(weight)
+        other_packed_weight = inductor_prims.rvv_pack_bf16_weight(other_weight)
+        counter = CompileCounterWithBackend("inductor")
+        opt_packed_linear = torch.compile(
+            packed_linear, backend=counter, dynamic=False, fullgraph=True
+        )
+        with torch.inference_mode():
+            torch.testing.assert_close(
+                opt_packed_linear(x, packed_weight),
+                F.linear(x, weight),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+            torch.testing.assert_close(
+                opt_packed_linear(x, other_packed_weight),
+                F.linear(x, other_weight),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+        self.assertEqual(counter.frame_count, 1)
+
+    @unittest.skipIf(platform.machine() != "riscv64", "RVV-only regression")
+    @config.patch(
+        {
+            "max_autotune_gemm": False,
+            "max_autotune_gemm_backends": "ATEN",
+            "cpp.weight_prepack": True,
+            "fx_graph_cache": False,
+            "fx_graph_remote_cache": False,
+        }
+    )
+    def test_rvv_bf16_explicit_packed_linear_mge2(self):
+        from torch._inductor import inductor_prims
+        from torch._inductor.cpu_vec_isa import pick_vec_isa
+
+        if not isinstance(pick_vec_isa(), cpu_vec_isa.VecRVV):
+            self.skipTest("VecRVV is not selected")
+
+        m, n, k = 16, 64, 128
+        x = torch.randn(m, k, dtype=torch.bfloat16)
+        weight = torch.randn(n, k, dtype=torch.bfloat16)
+        packed_weight = inductor_prims.rvv_pack_bf16_weight(weight)
+
+        def packed_linear(
+            inp: torch.Tensor, packed: torch.Tensor
+        ) -> torch.Tensor:
+            return inductor_prims.rvv_packed_bf16_linear(inp, packed, n)
+
+        with torch.inference_mode():
+            expected = F.linear(x, weight)
+            actual, code = run_and_get_cpp_code(
+                torch.compile(packed_linear, backend="inductor", fullgraph=True),
+                x,
+                packed_weight,
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        FileCheck().check("#include <riscv_vector.h>").check(
+            "kernel_micro_gemm"
+        ).check("__riscv_vfmacc").check_not(
+            "CppMicroGemmRVVBF16M1 requires M=1"
         ).check_not(
             "extern_kernels.mm"
         ).run(
