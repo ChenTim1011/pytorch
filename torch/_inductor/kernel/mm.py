@@ -21,7 +21,12 @@ from torch.nn.functional import ScalingType, SwizzleType  # type: ignore[attr-de
 from torch.torch_version import TorchVersion
 from torch.utils._ordered_set import OrderedSet
 
-from .. import config as inductor_config, distributed_autotune, lowering as L
+from .. import (
+    config as inductor_config,
+    distributed_autotune,
+    inductor_prims,
+    lowering as L,
+)
 from ..codegen.cutlass.gemm_template import CUTLASS2xGemmTemplate, CUTLASS3xGemmTemplate
 from ..codegen.flydsl.flydsl_template import FlyDSLTemplate
 from ..codegen.rocm.ck_tile_universal_gemm_template import CKTileGemmTemplate
@@ -34,6 +39,7 @@ from ..ir import (
     ChoiceCaller,
     ExternKernel,
     FallbackKernel,
+    FixedLayout,
     IRNode,
     is_triton,
     is_unaligned,
@@ -106,6 +112,50 @@ log = logging.getLogger(__name__)
 aten = torch.ops.aten
 prims = torch.ops.prims
 MXFPFormat = Literal["mxfp4", "mxfp8"]
+
+
+@register_lowering(
+    inductor_prims.rvv_packed_bf16_linear,
+    type_promotion_kind=None,
+)
+def tuned_rvv_packed_bf16_linear(
+    input,
+    packed_weight,
+    out_features,
+    layout_version=inductor_prims.RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION,
+):
+    if layout_version != inductor_prims.RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION:
+        raise AssertionError(
+            "unsupported RVV packed weight layout version: "
+            f"expected {inductor_prims.RVV_BF16_PACKED_WEIGHT_LAYOUT_VERSION}, "
+            f"got {layout_version}"
+        )
+    if len(input.get_size()) != 2:
+        raise AssertionError("RVV packed linear currently requires a 2D input")
+    if len(packed_weight.get_size()) != 3:
+        raise AssertionError("RVV packed weight must have [N-block, K, block-N] layout")
+
+    m, _ = input.get_size()
+    layout = FixedLayout(
+        input.get_device_or_error(),
+        input.get_dtype(),
+        [m, out_features],
+        [out_features, 1],
+    )
+    choices: list[ChoiceCaller] = []
+    CppGemmTemplate.add_explicit_packed_rvv_choices(
+        choices,
+        layout,
+        [input, packed_weight],
+    )
+    node, _ = autotune_select_algorithm(
+        "rvv_packed_bf16_linear",
+        choices,
+        [input, packed_weight],
+        layout,
+    )
+    return node
+
 
 # We define each template kernel in a separate file which is the name of the input to load_kernel_template
 # (e.g. triton_mm for templates/triton_mm.py.jinja).
