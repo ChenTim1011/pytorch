@@ -88,7 +88,7 @@ from torch._inductor.cpp_builder import (
     normalize_path_separator,
     run_asm_build_object,
 )
-from torch._inductor.cpu_vec_isa import invalid_vec_isa, pick_vec_isa
+from torch._inductor.cpu_vec_isa import invalid_vec_isa, pick_vec_isa, VecRVV
 from torch._inductor.custom_graph_pass import (
     CustomGraphModulePass,
     CustomGraphPass,
@@ -3934,11 +3934,18 @@ def _precompile_header(
     header: str,
     hashable_cmd_line: str,
     **compile_command: Any,
-) -> str:
+) -> str | None:
     if _IS_WINDOWS:
         raise AssertionError(
             "CppBuilder does not currently support precompiling on Windows!"
         )
+
+    if isinstance(compile_command.get("vec_isa"), VecRVV):
+        from torch._inductor.cpp_builder import is_gcc
+
+        # GCC 14/15 ICE when instantiating RVV intrinsic templates from a PCH.
+        if is_gcc():
+            return None
 
     # extra_flags carries link-time inputs (e.g. precompiled kernel .so paths
     # for CUTLASS/ROCm CK under JIT cpp_wrapper). Preprocessing and PCH
