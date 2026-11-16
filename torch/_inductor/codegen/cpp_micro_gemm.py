@@ -73,6 +73,8 @@ inline void {{kernel_name}}(
 )
 """
 
+    supports_runtime_weight = False
+
     def __init__(
         self,
         name,
@@ -1002,6 +1004,8 @@ inline void {{kernel_name}}_transpose_b_kernel(
     ),
 )
 class CppMicroGemmRVVBF16M1(CppMicroGemm):
+    supports_runtime_weight = True
+
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {
     {{kernel.assert_function}}(M == 1, "CppMicroGemmRVVBF16M1 requires M=1");
@@ -1113,6 +1117,8 @@ class CppMicroGemmRVVBF16M1(CppMicroGemm):
 )
 class CppMicroGemmRVVBF16MGe2(CppMicroGemm):
     """Compute BF16 GEMM with FP32 RVV accumulators for static M >= 2."""
+
+    supports_runtime_weight = True
 
     TEMPLATE_ENTRY = r"""
 {{declare_kernel}} {

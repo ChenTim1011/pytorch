@@ -661,9 +661,22 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         )
         return node
 
+    use_cpp_template = (
+        out_dtype is None and is_nonzero and use_cpp_gemm_template(layout, mat1, mat2)
+    )
+    prefer_cpp_without_autotune = use_cpp_template and not (
+        inductor_config.max_autotune or inductor_config.max_autotune_gemm
+    )
+    if prefer_cpp_without_autotune:
+        CppGemmTemplate.add_choices(
+            choices,
+            layout,
+            kernel_inputs.nodes(),
+        )
+
     templates_to_use: list[ExternKernelChoice | KernelTemplate] = []
     kwarg_overrides: dict[str, dict[str, Any]] = {}
-    if use_aten_gemm_kernels():
+    if use_aten_gemm_kernels() and (not prefer_cpp_without_autotune or not choices):
         templates_to_use.append(aten_handler)
         if aten_extra_kwargs:
             kwarg_overrides[aten_handler.uid] = aten_extra_kwargs
@@ -755,7 +768,7 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
 
         add_nv_universal_gemm_choices(choices, layout, kernel_inputs)
 
-    if out_dtype is None and use_cpp_gemm_template(layout, mat1, mat2):
+    if use_cpp_template and not prefer_cpp_without_autotune:
         CppGemmTemplate.add_choices(
             choices,
             layout,

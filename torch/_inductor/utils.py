@@ -3564,6 +3564,27 @@ def _use_template_for_cpu(layout: Layout) -> bool:
     ) and layout.device.type == "cpu"
 
 
+# Keep default-mode RVV compilation on static LLM projection-sized GEMMs.
+_RVV_BF16_TEMPLATE_MIN_OPS = 1_000_000
+_RVV_BF16_TEMPLATE_MAX_M = 128
+_RVV_BF16_TEMPLATE_MIN_N = 1024
+_RVV_BF16_TEMPLATE_MIN_K = 1024
+
+
+def _is_profitable_rvv_bf16_template_shape(
+    m: int,
+    n: int,
+    k: int,
+    ops: int,
+) -> bool:
+    return (
+        ops >= _RVV_BF16_TEMPLATE_MIN_OPS
+        and m <= _RVV_BF16_TEMPLATE_MAX_M
+        and n >= _RVV_BF16_TEMPLATE_MIN_N
+        and k >= _RVV_BF16_TEMPLATE_MIN_K
+    )
+
+
 def use_cpp_bmm_template(
     layout: Layout, mat1: ReinterpretView | Buffer, mat2: IRNode
 ) -> bool:
@@ -3599,12 +3620,21 @@ def use_cpp_gemm_template(
     is_woq_int4: bool = False,
     q_group_size: int | None = None,
 ) -> bool:
+    """Check CPU GEMM template eligibility, including RVV default routing."""
     from . import ir
-    from .codegen.cpp_micro_gemm import create_micro_gemm
+    from .codegen.cpp_micro_gemm import (
+        CppMicroGemmRVVBF16M1,
+        CppMicroGemmRVVBF16MGe2,
+        create_micro_gemm,
+    )
     from .codegen.cpp_utils import get_gemm_template_output_and_compute_dtype
     from .kernel.mm_common import mm_args
+    from .virtualized import V
 
-    if not _use_template_for_cpu(layout) or not _use_autotune_backend("CPP"):
+    if layout.device.type != "cpu":
+        return False
+
+    if _use_template_for_cpu(layout) and not _use_autotune_backend("CPP"):
         return False
 
     if not config.cpp.weight_prepack:
@@ -3627,6 +3657,15 @@ def use_cpp_gemm_template(
     if isinstance(mat2, ir.BaseView):
         mat2 = mat2.unwrap_view()
 
+    cpp_backend_enabled = _use_template_for_cpu(layout) and _use_autotune_backend("CPP")
+    rvv_bf16_dtypes = (
+        layout.dtype == torch.bfloat16
+        and mat1.get_dtype() == torch.bfloat16
+        and mat2.get_dtype() == torch.bfloat16
+    )
+    if not cpp_backend_enabled and not rvv_bf16_dtypes:
+        return False
+
     output_dtype, _ = get_gemm_template_output_and_compute_dtype(mat1.get_dtype())
     micro_gemm = create_micro_gemm(
         "micro_gemm",
@@ -3640,17 +3679,42 @@ def use_cpp_gemm_template(
         use_ref=not is_woq_int4,
         q_group_size=q_group_size,
     )
+    rvv_bf16_micro_gemm = (
+        isinstance(
+            micro_gemm,
+            (CppMicroGemmRVVBF16M1, CppMicroGemmRVVBF16MGe2),
+        )
+        and rvv_bf16_dtypes
+    )
+    if not cpp_backend_enabled and not rvv_bf16_micro_gemm:
+        return False
+    if not cpp_backend_enabled:
+        m_hint = V.graph.sizevars.optimization_hint(m, fallback=-1)
+        n_hint = V.graph.sizevars.optimization_hint(n, fallback=-1)
+        k_hint = V.graph.sizevars.optimization_hint(k, fallback=-1)
+        ops_hint = V.graph.sizevars.optimization_hint(m * n * k, fallback=-1)
+        if -1 in (m_hint, n_hint, k_hint, ops_hint) or not (
+            _is_profitable_rvv_bf16_template_shape(
+                m_hint,
+                n_hint,
+                k_hint,
+                ops_hint,
+            )
+        ):
+            return False
 
     def is_last_dim_stride1(x: IRNode) -> bool:
         x.freeze_layout()
         return x.get_stride()[-1] == 1
+
+    allow_runtime_mat2 = rvv_bf16_micro_gemm
 
     return (
         layout.dtype in layout_dtypes
         and micro_gemm is not None
         and is_last_dim_stride1(mat1)  # TODO(jgong5): support transposed input
         and isinstance(mat2, ir.StorageBox)
-        and (mat2.is_module_buffer() or not require_constant_mat2)
+        and (mat2.is_module_buffer() or not require_constant_mat2 or allow_runtime_mat2)
     )
 
 
